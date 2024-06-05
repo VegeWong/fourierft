@@ -17,7 +17,9 @@ import pdb
 import math
 import warnings
 from typing import Any, List, Optional, Union
-from args import *
+from dataclasses import dataclass
+
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -26,22 +28,34 @@ import torch.nn.functional as F
 from peft.tuners.tuners_utils import BaseTunerLayer
 from peft.utils.other import transpose
 
-args_l = get_args()
+
+@dataclass
+class FourierArguments:
+    set_bias: bool = False
+    fc: float = 1.0
+    width: float = 200.0
+    share_entry: bool = False
+    entry_seed: int = 2024
+
+
+args_l = FourierArguments()
+
 
 def FFT_SHIFT(matrix):
-        m_clone = matrix.clone()
-        m,n = m_clone.shape
-        m = int(m / 2)
-        n = int(n / 2)
+    m_clone = matrix.clone()
+    m, n = m_clone.shape
+    m = int(m / 2)
+    n = int(n / 2)
 
-        for i in range(m):
-            for j in range(n):
-                m_clone[i][j] = matrix[m+i][n+j]
-                m_clone[m+i][n+j] = matrix[i][j]
-                m_clone[m+i][j] = matrix[i][j+n]
-                m_clone[i][j+n] = matrix[m+i][j]
-        return m_clone
-        
+    for i in range(m):
+        for j in range(n):
+            m_clone[i][j] = matrix[m + i][n + j]
+            m_clone[m + i][n + j] = matrix[i][j]
+            m_clone[m + i][j] = matrix[i][j + n]
+            m_clone[i][j + n] = matrix[m + i][j]
+    return m_clone
+
+
 class FourierLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
     adapter_layer_names = ["spectrum"]
@@ -87,39 +101,41 @@ class FourierLayer(BaseTunerLayer):
         self.in_features = in_features
         self.out_features = out_features
 
-
     def update_layer(self, adapter_name, n_frequency, scale, init_fourier_weights=None):
         # print('\033 args in layer \033[0m', args)
         if n_frequency <= 0:
             raise ValueError(f"`n_frequency` should be a positive integer value but the value passed is {n_frequency}")
         self.n_frequency[adapter_name] = n_frequency
         self.scale[adapter_name] = scale
-        if n_frequency > 0:  
-
+        if n_frequency > 0:
             if args_l.set_bias:
                 d = self.in_features
-                center_frequency = args_l.fc  # D_0 
-                width = args_l.width   # W
-                order = 2 # 2n
+                center_frequency = args_l.fc  # D_0
+                width = args_l.width  # W
+                order = 2  # 2n
                 rows, cols = np.ogrid[:d, :d]
-                distance = np.sqrt((rows - d / 2)**2 + (cols - d / 2)**2)
-                mask_gs = torch.tensor(np.exp(-(distance * width / (distance**2 - center_frequency**2))**(-2)))
+                distance = np.sqrt((rows - d / 2) ** 2 + (cols - d / 2) ** 2)
+                mask_gs = torch.tensor(np.exp(-((distance * width / (distance**2 - center_frequency**2)) ** (-2))))
                 mask_gs = FFT_SHIFT(mask_gs)
-                samples = torch.multinomial(mask_gs.view(-1),1000, replacement=True)
+                samples = torch.multinomial(mask_gs.view(-1), 1000, replacement=True)
                 samples = torch.stack([samples // d, samples % d], dim=1).T
                 self.indices[adapter_name] = samples
-                print('\033[32m Using frequency bias... \033[0m')
+                print("\033[32m Using frequency bias... \033[0m")
 
             # print('\033[32m new_peft_official\033[0m')
             elif args_l.share_entry:
-                self.indices[adapter_name] = torch.randperm(self.in_features * self.in_features,generator=torch.Generator().manual_seed(args_l.entry_seed))[:n_frequency]
-                print('\033[32m Using shared entry... \033[0m')
+                self.indices[adapter_name] = torch.randperm(
+                    self.in_features * self.in_features, generator=torch.Generator().manual_seed(args_l.entry_seed)
+                )[:n_frequency]
+                print("\033[32m Using shared entry... \033[0m")
             else:
                 self.indices[adapter_name] = torch.randperm(self.in_features * self.in_features)[:n_frequency]
-                
-            self.indices[adapter_name] = torch.stack([self.indices[adapter_name] // self.in_features, self.indices[adapter_name] % self.in_features], dim=0)
+
+            self.indices[adapter_name] = torch.stack(
+                [self.indices[adapter_name] // self.in_features, self.indices[adapter_name] % self.in_features], dim=0
+            )
             self.spectrum[adapter_name] = nn.Parameter(torch.randn(n_frequency), requires_grad=True)
-  
+
         # if init_fourier_weights == "loftq":
         #     self.loftq_init(adapter_name)
         # elif init_fourier_weights:
@@ -207,7 +223,6 @@ class FourierLayer(BaseTunerLayer):
 #  Copyright (c) Microsoft Corporation. All rights reserved.
 #  Licensed under the MIT License (MIT). See LICENSE in the repo root for license information.
 #  ------------------------------------------------------------------------------------------
-
 
 
 class Linear(nn.Module, FourierLayer):
@@ -301,9 +316,13 @@ class Linear(nn.Module, FourierLayer):
 
         spectrum = self.spectrum[adapter]
         indices = self.indices[adapter].to(spectrum.device)
-        
 
-        weight = torch.fft.ifft2(torch.sparse.FloatTensor(indices, spectrum, [self.in_features, self.in_features]).to_dense()).real * 300
+        weight = (
+            torch.fft.ifft2(
+                torch.sparse.FloatTensor(indices, spectrum, [self.in_features, self.in_features]).to_dense()
+            ).real
+            * 300
+        )
         if cast_to_fp32:
             weight = weight.float()
 
@@ -331,20 +350,22 @@ class Linear(nn.Module, FourierLayer):
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.spectrum.keys():
                     continue
-                
+
                 spectrum = self.spectrum[active_adapter]
                 indices = self.indices[active_adapter].to(spectrum.device)
                 scale = self.scale[active_adapter]
 
                 ## sparse_coo_tensor will lead to similar GPU cost but longer training time, so it is not recommended
-                # delta_w = torch.fft.ifft2(torch.sparse_coo_tensor(indices, spectrum, [self.in_features, self.in_features],  
-                                            # dtype=spectrum.dtype, device=spectrum.device).to_dense()).real * scale
+                # delta_w = torch.fft.ifft2(torch.sparse_coo_tensor(indices, spectrum, [self.in_features, self.in_features],
+                # dtype=spectrum.dtype, device=spectrum.device).to_dense()).real * scale
 
-                dense_s = torch.zeros((self.in_features, self.in_features),dtype=spectrum.dtype,device='cuda')
+                cast_to_dtype = spectrum.dtype if (spectrum.dtype != torch.float16 or spectrum.dtype != torch.bfloat16) else torch.float32
+
+                dense_s = torch.zeros((self.in_features, self.in_features), dtype=cast_to_dtype, device="cuda")
                 dense_s[indices[0, :], indices[1, :]] = spectrum
                 delta_w = torch.fft.ifft2(dense_s).real * scale
                 x = x.to(spectrum.dtype)
-                result += torch.einsum('ijk,kl->ijl', x, delta_w)
+                result += torch.einsum("ijk,kl->ijl", x, delta_w)
 
         result = result.to(previous_dtype)
         return result
